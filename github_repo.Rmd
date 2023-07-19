@@ -1,0 +1,931 @@
+---
+title: "thesis_R_code"
+author: "Thomas Bahne"
+date: "2023-07-16"
+output: pdf_document
+---
+
+```{r imports, echo = FALSE}
+library(ggplot2)
+library(tibble)
+library(dplyr)
+library(Rcpp)
+library(latex2exp)
+library(stringr)
+sourceCpp("nct.cpp")
+```
+
+```{r functions, echo = FALSE}
+mse <- function(predicted, actual){
+  return(mean((actual - predicted)^2))
+}
+
+get_tstat_theoretical_mean <- function(ncp, df) {
+  return(
+      ncp * sqrt(df / 2) * gamma((df - 1) / 2) / gamma(df / 2) 
+  )
+}
+
+
+dnct_vec_x <- Vectorize(
+  FUN = dnct, 
+  vectorize.args = c("x")
+  )
+
+
+truncated_pdf <- function(x, df, ncp, t_crit) {
+  if(pnct(q = t_crit, df = df, ncp = ncp) == 1) {
+    print("Denominator of zero encountered in truncated_pdf. Returning density of 0.")
+    return(0)
+  }
+  return(
+    dnct_vec_x(x = x, df = df, ncp = ncp) /
+    (1-pnct(q = t_crit, df = df, ncp = ncp)) *
+    (x > t_crit)
+    )
+}
+
+
+truncated_mean_integral <- function(x, df, ncp, t_crit) {
+  res = x*truncated_pdf(x = x, df = df, ncp = ncp, t_crit = t_crit)
+  if(any(is.nan(res))){
+    stop("NaN encountered in truncated_mean_integral")
+  }
+  return(res)
+}
+
+
+get_tstat_theoretical_truncated_mean <- function(ncp, df, t_crit) {
+  return(
+    integrate(
+      f = truncated_mean_integral,
+      lower = t_crit+.Machine$double.eps,
+      upper = Inf,
+      df = df,
+      ncp = ncp,
+      t_crit = t_crit,
+      subdivisions = 2000L#,
+      #rel.tol =.Machine$double.eps^0.05
+    )$value
+  )
+}
+
+
+
+# define functions to calculate ncp pdf and cdf
+
+dnct_vec_ncp <- Vectorize(FUN = dnct, vectorize.args = c("ncp"))
+
+
+ncp_normalizing_constant <- function(t, df) {
+  return(
+    integrate(
+      f = dnct_vec_ncp,
+      upper = Inf,
+      lower = -Inf,
+      df = df,
+      x = t
+    )$value
+  )
+}
+
+
+d_ncp <- function(ncp, t, df) {
+  normalizing_constant <- ncp_normalizing_constant(t = t, df = df)
+  return(dnct_vec_ncp(ncp = ncp, x = t, df = df) / normalizing_constant)
+}
+
+
+p_ncp <- function(ncp, t, df) {
+  normalizing_constant <- ncp_normalizing_constant(t = t, ncp = ncp)
+  return(
+    integrate(
+      f = d_ncp,
+      upper = ncp,
+      lower = -Inf,
+      t = t,
+      df = df,
+    )$value
+  )
+}
+
+
+
+# bias calculation
+### use modified versions of existing functions to enable vectorization
+
+get_tstat_theoretical_truncated_mean_vec_ncp <- Vectorize(
+  FUN = get_tstat_theoretical_truncated_mean,
+  vectorize.args = c("ncp"))
+
+
+get_bias_integration_lower_bound <- function(
+    t, 
+    df, 
+    stepsize = 0.01, 
+    precision = .Machine$double.eps*1e5
+) {
+  max_range <- 5
+  while(d_ncp(ncp = t - max_range, t = t, df = df) > 0) {
+    max_range <- max_range * 1.2
+  }
+  difference <- seq(from = max_range, to = 0, by = -stepsize)
+  for(i in seq_along(difference)) {
+    if(d_ncp(ncp = t - difference[i], t = t, df = df) > precision) {
+      return(t - difference[i])
+    }
+  }
+}
+
+
+get_bias_integration_upper_bound <- function(
+    t, 
+    df, 
+    stepsize = 0.01, 
+    precision = .Machine$double.eps*1e5
+) {
+  max_range <- 5
+  while(d_ncp(ncp = t + max_range, t = t, df = df) > precision) {
+    max_range <- max_range * 1.2
+  }
+  difference <- seq(from = max_range, to = 0, by = -stepsize)
+  for(i in seq_along(difference)) {
+    if(d_ncp(ncp = t + difference[i], t = t, df = df) > precision) {
+      return(t + difference[i])
+    }
+  }
+}
+
+
+bias_integral <- function(ncp, t, t_crit, df) {
+  return(
+    d_ncp(ncp = ncp, t = t, df = df) *
+      (
+        get_tstat_theoretical_truncated_mean_vec_ncp(ncp = ncp, df = df, t_crit = t_crit) -
+          get_tstat_theoretical_mean(ncp = ncp, df = df)
+      )
+  )
+}
+
+
+get_expected_bias <- function(t_obs, t_crit, df){
+  lower_bound <- get_bias_integration_lower_bound(t = t_obs, df = df)
+  upper_bound <- get_bias_integration_upper_bound(t = t_obs, df = df)
+  return(
+    integrate(
+      f = Vectorize(bias_integral, vectorize.args = c("ncp")),
+      lower = lower_bound,
+      upper = upper_bound,
+      t = t_obs,
+      t_crit = t_crit,
+      df = df
+    )$value
+  )
+}
+```
+
+# Define constants
+
+```{r constants}
+set.seed(6)
+alpha <-  0.05
+n_control <- 10
+n_treatment <- n_control
+degrees_of_freedom <- n_control + n_treatment - 2
+var_control <- 1
+var_treatment <- var_control
+t_crit <- qt(p = 1-alpha, df = degrees_of_freedom)
+t_mid <- t_crit + 0.5
+epsilon <- 0.05
+```
+
+# Experiment 1
+
+```{r experiment_1}
+ncp_seq <- seq(from = -5, to = 7.5, by=0.01)
+truncated_means <- vector(mode = "numeric", length=length(ncp_seq))
+regular_means <- vector(mode = "numeric", length=length(ncp_seq))
+for(i in seq_along(ncp_seq)) {
+  
+ truncated_means[i] <- get_tstat_theoretical_truncated_mean(
+   ncp = ncp_seq[i], 
+   df = degrees_of_freedom, 
+   t_crit = t_crit
+   )
+ 
+ regular_means[i] <- get_tstat_theoretical_mean(
+   ncp = ncp_seq[i], 
+   df = degrees_of_freedom
+   )
+}
+
+ex1_plt <- ggplot(
+  data = tibble(
+    x = rep(ncp_seq, 3), 
+    expectation = c(truncated_means, regular_means, truncated_means-regular_means),
+    type = rep(c("E[t|t>t_crit]", "E[t]", "Bias"), each = length(ncp_seq))
+  ),
+  aes(x = x, y = expectation, color = type)
+) +
+  geom_line() +
+  labs(x = "noncentrality parameter", y = "expected value", color = "Legend") +
+  scale_color_discrete(labels = c("bias", TeX(r"($E[t]$)"), TeX(r"($E[t\, | \, t>t_{1-\alpha}]$)"))) +
+  theme_minimal() +
+    theme(
+    legend.position = "top",
+    legend.box.background = element_rect(fill="white")
+  ) +
+  guides(colour = guide_legend(title.position="top", title.hjust = 0.5))
+
+print(ex1_plt)
+
+ggsave(
+  filename = "bias_df18.png",
+  plot = ex1_plt,
+  device = "png",
+  path = "generated_plots/",
+  width = 2060,
+  height = 1440,
+  units = "px",
+  dpi = "print"
+)
+```
+
+# Experiment 2
+
+```{r experiment_2}
+t_seq <- seq(from = -8, to = 8, by = 4)
+num_evals <- 1000
+eval_range <- 8
+evals <- vector(mode = "numeric", length = num_evals * length(t_seq))
+ncp_evals <- c()
+for(i in 1:length(t_seq)){
+  eval_seq <- seq(
+    from = t_seq[i]-eval_range, 
+    to = t_seq[i]+eval_range, 
+    length.out = num_evals
+    )
+  ncp_evals <- c(ncp_evals, eval_seq)
+  for(j in 1:length(eval_seq)){
+    evals[(i-1)*length(eval_seq) + j] <- d_ncp(
+      ncp = eval_seq[j], 
+      df = degrees_of_freedom,
+      t = t_seq[i]
+      )
+  }
+}
+
+t_factor <- c()
+for(i in 1:length(t_seq)){
+  t_factor <- c(t_factor, sprintf("t = %i", t_seq[i]))
+}
+
+df <- tibble(ncp = ncp_evals, density = evals, t = rep(t_factor, each = num_evals))
+df[["t"]] <- factor(df[["t"]], levels = c("t = -8", "t = -4", "t = 0", "t = 4", "t = 8"))
+
+ex2_plt <- ggplot(
+  data = df, 
+  aes(x = ncp_evals, y = density, color = t)
+  ) +
+  geom_line(linewidth = 0.75) +
+  labs(y = "density", x = "noncentrality parameter", color = "Legend") +
+  theme_minimal() +
+  theme(
+    legend.position = "right",
+    legend.box.background = element_rect(fill="white")
+  ) +
+  guides(colour = guide_legend(title.position="top", title.hjust = 0.5))
+
+print(ex2_plt)
+
+ggsave(
+  filename = "theoretical_ncp_distribution_df18.png",
+  plot = ex2_plt,
+  device = "png",
+  path = "generated_plots/",
+  width = 2060,
+  height = 1440,
+  units = "px",
+  dpi = "print"
+)
+```
+
+# Experiment 3
+
+```{r experiment_3}
+t_seq <- seq(t_crit , t_crit + 5, by = 0.1)
+expected_biases <- vector(mode = "numeric", length = length(t_seq))
+
+for(i in seq_along(t_seq)) {
+  expected_biases[i] <- get_expected_bias(t_obs = t_seq[i], t_crit = t_crit, df = degrees_of_freedom)
+}
+
+if(format(t_crit, digits = 5) != 1.7341){
+  stop("Change plot legend label, t_1-alpha = 1.7341 is hard-coded")
+} 
+
+ex3_plt <- ggplot(data = tibble(x = t_seq, y = expected_biases), aes(x = x, y = y)) +
+  geom_line(
+    aes(linetype = "E[bias]"), 
+    linewidth = 0.75
+    ) +
+  lims(x = c(min(0, min(t_seq)), max(0, max(t_seq)))) +
+  geom_vline(
+    aes(xintercept = t_crit, , linetype = "t_crit"),
+    linewidth = 0.75,
+    show.legend = FALSE) +
+  labs(
+    y = "E[bias]", 
+    x = "t-statistic", 
+    linetype = "Legend"
+  ) +
+  scale_y_continuous(breaks=seq(from=0, to = 1, by = 0.2), limits = c(0,1)) +
+  scale_linetype_discrete(
+    labels = c("E[bias]", TeX(r"($t_{1-\alpha} = 1.7341$)"))) +
+  theme_minimal() +
+  theme(
+    legend.position = "top",
+    legend.box.background = element_rect(fill="white")) +
+  guides(
+    linetype = guide_legend(
+      title.position="top", 
+      title.hjust = 0.5
+      )
+    )
+
+print(ex3_plt)
+
+ggsave(
+  filename = "expected_bias_df18.png",
+  plot = ex3_plt,
+  device = "png",
+  path = "generated_plots/",
+  width = 2060,
+  height = 1440,
+  units = "px",
+  dpi = "print"
+)
+```
+
+# Experiment 4
+
+```{r experiment_4}
+n_4 <- 1000000
+
+ex4_descriptions <- c(
+  "rnorm_mean_minus1_sd0.5",
+  "rnorm_mean_minus1_sd1",
+  "rnorm_mean_minus1_sd2",
+  "rnorm_mean_minus1_sd3",
+  "rnorm_mean_minus07_sd0.5",
+  "rnorm_mean_minus07_sd1",
+  "rnorm_mean_minus07_sd2",
+  "rnorm_mean_minus07_sd3",
+  "rnorm_mean_minus03_sd0.5",
+  "rnorm_mean_minus03_sd1",
+  "rnorm_mean_minus03_sd2",
+  "rnorm_mean_minus03_sd3",
+  "rnorm_mean_0_sd0.5",
+  "rnorm_mean_0_sd1",
+  "rnorm_mean_0_sd2",
+  "rnorm_mean_0_sd3",
+  "rnorm_mean_03_sd0.5",
+  "rnorm_mean_03_sd1",
+  "rnorm_mean_03_sd2",
+  "rnorm_mean_03_sd3",
+  "rnorm_mean_07_sd0.5",
+  "rnorm_mean_07_sd1",
+  "rnorm_mean_07_sd2",
+  "rnorm_mean_07_sd3",
+  "rnorm_mean_1_sd0.5",
+  "rnorm_mean_1_sd1",
+  "rnorm_mean_1_sd2",
+  "rnorm_mean_1_sd3",
+  "rnorm_mean_2_sd0.5",
+  "rnorm_mean_2_sd1",
+  "rnorm_mean_2_sd2",
+  "rnorm_mean_2_sd3",
+  "rnorm_mean_3_sd0.5",
+  "rnorm_mean_3_sd1",
+  "rnorm_mean_3_sd2",
+  "rnorm_mean_3_sd3",
+    "runif_minus4_4",
+  "runif_minus3_3",
+  "runif_minus2_2",
+  "runif_minus1_1",
+  "runif_minus07_07",
+  "runif_minus03_03",
+  "runif_0_03",
+  "runif_0_07",
+  "runif_0_01",
+  "runif_minus03_1"
+)
+ 
+ex4_true_meandiffs <- list(
+  rnorm(n = n_4, mean = -1, sd = 0.5),
+  rnorm(n = n_4, mean = -1, sd = 1),
+  rnorm(n = n_4, mean = -1, sd = 2),
+  rnorm(n = n_4, mean = -1, sd = 3),
+  rnorm(n = n_4, mean = -0.7, sd = 0.5),
+  rnorm(n = n_4, mean = -0.7, sd = 1),
+  rnorm(n = n_4, mean = -0.7, sd = 2),
+  rnorm(n = n_4, mean = -0.7, sd = 3),
+  rnorm(n = n_4, mean = -0.3, sd = 0.5),
+  rnorm(n = n_4, mean = -0.3, sd = 1),
+  rnorm(n = n_4, mean = -0.3, sd = 2),
+  rnorm(n = n_4, mean = -0.3, sd = 3),
+  rnorm(n = n_4, mean = 0, sd = 0.5),
+  rnorm(n = n_4, mean = 0, sd = 1),
+  rnorm(n = n_4, mean = 0, sd = 2),
+  rnorm(n = n_4, mean = 0, sd = 3),
+  rnorm(n = n_4, mean = 0.3, sd = 0.5),
+  rnorm(n = n_4, mean = 0.3, sd = 1),
+  rnorm(n = n_4, mean = 0.3, sd = 2),
+  rnorm(n = n_4, mean = 0.3, sd = 3),
+  rnorm(n = n_4, mean = 0.7, sd = 0.5),
+  rnorm(n = n_4, mean = 0.7, sd = 1),
+  rnorm(n = n_4, mean = 0.7, sd = 2),
+  rnorm(n = n_4, mean = 0.7, sd = 3),
+  rnorm(n = n_4, mean = 1, sd = 0.5),
+  rnorm(n = n_4, mean = 1, sd = 1),
+  rnorm(n = n_4, mean = 1, sd = 2),
+  rnorm(n = n_4, mean = 1, sd = 3),
+  rnorm(n = n_4, mean = 2, sd = 0.5),
+  rnorm(n = n_4, mean = 2, sd = 1),
+  rnorm(n = n_4, mean = 2, sd = 2),
+  rnorm(n = n_4, mean = 2, sd = 3),
+  rnorm(n = n_4, mean = 3, sd = 0.5),
+  rnorm(n = n_4, mean = 3, sd = 1),
+  rnorm(n = n_4, mean = 3, sd = 2),
+  rnorm(n = n_4, mean = 3, sd = 3),
+  runif(n = n_4, min = -4, max = 4),
+  runif(n = n_4, min = -3, max = 3),
+  runif(n = n_4, min = -2, max = 2),
+  runif(n = n_4, min = -1, max = 1),
+  runif(n = n_4, min = -0.7, max = 0.7),
+  runif(n = n_4, min = -0.3, max = 0.3),
+  runif(n = n_4, min = 0, max = 0.3),
+  runif(n = n_4, min = 0, max = 0.7),
+  runif(n = n_4, min = 0, max = 1),
+  runif(n = n_4, min = -0.3, max = 1)
+)
+
+ex4_time <- Sys.time()
+for(config_num in 1:length(ex4_descriptions)) {
+  # Tracking runtime during execution
+  print(paste("Running configuration ", config_num))
+  print(paste("Time elapsed since last config: ", Sys.time() - ex4_time))
+  ex4_time <- Sys.time()
+  
+  ex4_t_stats <- vector(mode = "numeric", length = n_4)
+  ex4_ncps <- ex4_true_meandiffs[[config_num]] / var_control * sqrt(n_treatment/2)
+  
+  for(simulation_num in 1:n_4){
+    ex4_control <- rnorm(n = n_control, mean = 0, sd = sqrt(var_control))
+    
+    ex4_treatment <- rnorm(
+      n = n_treatment, 
+      mean = ex4_true_meandiffs[[config_num]][simulation_num], 
+      sd = sqrt(var_treatment)
+    )
+    
+    ex4_test <- t.test(
+      x = ex4_treatment,
+      y = ex4_control,
+      alternative = "greater", # tests x > y
+      mu = 0, # indicates H_0: mean(x) - mean(y) = 0
+      paired = FALSE,
+      var.equal = TRUE,
+      conf.level = 1-alpha
+    )
+    
+    ex4_t_stats[simulation_num] <- ex4_test$statistic
+  }
+
+  
+  # discard all values which are not close to the desired fixed_t_for_ncps
+  ex4_is_in_epsilon_neighborhood <- abs(ex4_t_stats - t_mid) <= epsilon
+  ex4_ncps_in_epsilon_neighborhood <- ex4_ncps[ex4_is_in_epsilon_neighborhood]
+  
+  # define appropriate x-axis limits for the plot
+  ex4_x_low <- min(
+    t_mid - 4, 
+    min(ex4_ncps_in_epsilon_neighborhood),
+    na.rm = TRUE # in case ncps_of_t_stats_near_fixed_t_ncp_dist is empty
+    ) 
+  ex4_x_high <- max(
+    t_mid + 4, 
+    max(ex4_ncps_in_epsilon_neighborhood),
+    na.rm = TRUE # in case ncps_of_t_stats_near_fixed_t_ncp_dist is empty
+    )
+  
+  # plot ncp distribution
+  ex4_plot <- ggplot() +
+    geom_histogram(
+      aes(
+        x = ex4_ncps_in_epsilon_neighborhood, 
+        y = after_stat(density),
+        color = "histogram"
+        ), 
+      fill = "white",
+      bins = 50) +
+    geom_function(
+      aes(color = "assumed density"),
+      fun = d_ncp, 
+      args = list(df = degrees_of_freedom, t = t_mid)
+      ) +
+    scale_color_manual(
+      labels = c(TeX(r"($g_\delta$)"), "histogram"),
+      values = c("red", "black")
+      ) +
+    labs(
+      x = "noncentrality parameter", 
+      color = "Legend",
+      caption = sprintf(
+        "histogram of %i noncentrality parameters", 
+        length(ex4_ncps_in_epsilon_neighborhood)
+      )
+    ) +
+    xlim(ex4_x_low, ex4_x_high) +
+    theme_minimal(base_size = 24) +
+    theme(
+      legend.position = "top",
+      legend.box.background = element_rect(fill="white"),
+      legend.title = element_text(size=24),
+      legend.text = element_text(size=22),
+      legend.key.width = unit(1, "cm"),
+      legend.key.height = unit(1, "cm")
+    ) +
+    guides(
+      linetype = guide_legend(
+        title.position="top", 
+        title.hjust = 0.5
+      )
+    )
+  
+  print(ex4_plot)
+  ggsave(
+    ex4_plot,
+    filename = paste(ex4_descriptions[config_num],".pdf",sep =""),
+    path = "generated_plots/",
+    device ="pdf",
+    dpi = "print",
+    width = 1440*2,
+    height = 1440*2,
+    units = "px",
+  )
+}
+```
+
+# Experiment 5
+
+## Using different named distributions for $F$
+
+```{r experiment_5}
+
+n_5 <- 1000 # n_5 = 1000 has a runtime of roughly 4 minutes per F
+
+v = c(-5, -4, -3, -2, -1, -0.7, -0.3, 0, 0, 0, 0, 0, -0.3, rep(NaN, 36))
+w = c(5, 4, 3, 2, 1, 0.7, 0.3, 0.3, 0.7, 1, 2, 3, 1, rep(NaN, 36))
+mu = c(rep(NaN, 13), rep(c(-1, -0.7, -0.3, 0, 0.3, 0.7, 1, 2, 3), each = 4))
+sigma = c(rep(NaN, 13), rep(c(0.5, 1, 2, 3), 9))
+
+ex5_true_meandiffs <- list(
+  runif(n = n_5, min = -5, max = 5),
+  runif(n = n_5, min = -4, max = 4),
+  runif(n = n_5, min = -3, max = 3),
+  runif(n = n_5, min = -2, max = 2),
+  runif(n = n_5, min = -1, max = 1),
+  runif(n = n_5, min = -0.7, max = 0.7),
+  runif(n = n_5, min = -0.3, max = 0.3),
+  runif(n = n_5, min = 0, max = 0.3),
+  runif(n = n_5, min = 0, max = 0.7),
+  runif(n = n_5, min = 0, max = 1),
+  runif(n = n_5, min = 0, max = 2),
+  runif(n = n_5, min = 0, max = 3),
+  runif(n = n_5, min = -0.3, max = 1),
+    rnorm(n = n_5, mean = -1, sd = 0.5), #yields ~5 signif. tstats for n_5=1000
+  rnorm(n = n_5, mean = -1, sd = 1),
+  rnorm(n = n_5, mean = -1, sd = 2),
+  rnorm(n = n_5, mean = -1, sd = 3),
+  rnorm(n = n_5, mean = -0.7, sd = 0.5),
+  rnorm(n = n_5, mean = -0.7, sd = 1),
+  rnorm(n = n_5, mean = -0.7, sd = 2),
+  rnorm(n = n_5, mean = -0.7, sd = 3),
+  rnorm(n = n_5, mean = -0.3, sd = 0.5),
+  rnorm(n = n_5, mean = -0.3, sd = 1),
+  rnorm(n = n_5, mean = -0.3, sd = 2),
+  rnorm(n = n_5, mean = -0.3, sd = 3),
+  rnorm(n = n_5, mean = 0, sd = 0.5),
+  rnorm(n = n_5, mean = 0, sd = 1),
+  rnorm(n = n_5, mean = 0, sd = 2),
+  rnorm(n = n_5, mean = 0, sd = 3),
+  rnorm(n = n_5, mean = 0.3, sd = 0.5),
+  rnorm(n = n_5, mean = 0.3, sd = 1),
+  rnorm(n = n_5, mean = 0.3, sd = 2),
+  rnorm(n = n_5, mean = 0.3, sd = 3),
+  rnorm(n = n_5, mean = 0.7, sd = 0.5),
+  rnorm(n = n_5, mean = 0.7, sd = 1),
+  rnorm(n = n_5, mean = 0.7, sd = 2),
+  rnorm(n = n_5, mean = 0.7, sd = 3),
+  rnorm(n = n_5, mean = 1, sd = 0.5),
+  rnorm(n = n_5, mean = 1, sd = 1),
+  rnorm(n = n_5, mean = 1, sd = 2),
+  rnorm(n = n_5, mean = 1, sd = 3),
+  rnorm(n = n_5, mean = 2, sd = 0.5),
+  rnorm(n = n_5, mean = 2, sd = 1),
+  rnorm(n = n_5, mean = 2, sd = 2),
+  rnorm(n = n_5, mean = 2, sd = 3),
+  rnorm(n = n_5, mean = 3, sd = 0.5),
+  rnorm(n = n_5, mean = 3, sd = 1),
+  rnorm(n = n_5, mean = 3, sd = 2),
+  rnorm(n = n_5, mean = 3, sd = 3)
+)
+
+# initialize vectors to store results
+ex5_sample_mean <- vector(mode = "numeric", length = length(ex5_true_meandiffs))
+ex5_estimate_naive <- vector(mode = "numeric", length = length(ex5_true_meandiffs))
+ex5_estimate_debiased <- vector(mode = "numeric", length = length(ex5_true_meandiffs))
+
+ex5_time <- Sys.time()
+for(config_num in 1:length(ex5_true_meandiffs)) {
+  # Tracking runtime during execution
+  print(paste("Running configuration ", config_num))
+  print(paste("Time elapsed since last config: ", Sys.time() - ex5_time))
+  ex5_time <- Sys.time()
+  
+  config_meandiff <- ex5_true_meandiffs[[config_num]]
+  ex5_t_stats <- vector(mode = "numeric", length = n_5)
+
+  for(simulation_num in 1:n_5){
+    ex5_control <- rnorm(n = n_control, mean = 0, sd = sqrt(var_control))
+    ex5_treatment <- rnorm(n = n_treatment, mean = config_meandiff[simulation_num], sd = sqrt(var_treatment))
+    
+    ex5_test <- t.test(
+      x = ex5_treatment,
+      y = ex5_control,
+      alternative = "greater", # tests x > y
+      mu = 0, # indicates H_0: mean(x) - mean(y) = 0
+      paired = FALSE,
+      var.equal = TRUE,
+      conf.level = 1-alpha
+    )
+    
+    ex5_t_stats[simulation_num] <- ex5_test$statistic
+  }
+  ex5_is_significant <- (ex5_t_stats >= t_crit)
+  print(paste("Significant statistics: ", sum(ex5_is_significant)))
+  ex5_t_stats_significant <- ex5_t_stats[ex5_is_significant]
+  ex5_sample_mean[config_num] <- mean(ex5_t_stats)
+  ex5_estimate_naive[config_num] <- mean(ex5_t_stats_significant)
+  
+  ex5_expected_biases <- Vectorize(FUN = get_expected_bias, vectorize.args = c("t_obs"))(
+      t_obs = ex5_t_stats_significant,
+      t_crit = t_crit,
+      df = degrees_of_freedom
+      )
+
+  ex5_estimate_debiased[config_num] <- mean(ex5_t_stats_significant - ex5_expected_biases)
+}
+
+ex5_results <- tibble(
+  v = v,
+  w = w,
+  mu = mu,
+  sigma = sigma,
+  mean = ex5_sample_mean,
+  estimate_naive = ex5_estimate_naive,
+  estimate_debiased = ex5_estimate_debiased,
+)
+```
+
+## Using the re-randomization procedure
+
+```{r experiment_5_rerandomizing}
+
+ex5_rerandom_n_initial_tests <- 1000000
+
+ex5_rerandom_initial_true_meandiff <- runif(
+  n = ex5_rerandom_n_initial_tests, 
+  min = -3, 
+  max = 3
+  )
+ex5_initial_ncps <- ex5_rerandom_initial_true_meandiff / var_control * sqrt(n_treatment/2)
+
+ex5_rerandom_initial_tstas <- vector(mode = "numeric", length = ex5_rerandom_n_initial_tests)
+
+for(test_num in 1:ex5_rerandom_n_initial_tests){
+  if(test_num %% 100000 == 0){print(test_num)}
+  ex5_rerandom_control <- rnorm(
+    n = n_control, 
+    mean = 0, 
+    sd = sqrt(var_control)
+    )
+  
+  ex5_rerandom_treatment <- rnorm(
+    n = n_treatment, 
+    mean = ex5_rerandom_initial_true_meandiff[test_num], 
+    sd = sqrt(var_treatment)
+  )
+  
+  ex5_rerandom_test <- t.test(
+    x = ex5_rerandom_treatment,
+    y = ex5_rerandom_control,
+    alternative = "greater", # tests x > y
+    mu = 0, # indicates H_0: mean(x) - mean(y) = 0
+    paired = FALSE,
+    var.equal = TRUE,
+    conf.level = 1-alpha
+  )
+  
+  ex5_rerandom_initial_tstas[test_num] <- ex5_rerandom_test$statistic
+}
+
+# discard all values which are not close to the desired fixed_t_for_ncps
+ex5_is_in_epsilon_neighborhood <- abs(ex5_rerandom_initial_tstas - t_mid) <= epsilon
+ex5_filtered_ncps <- ex5_initial_ncps[ex5_is_in_epsilon_neighborhood]
+
+ex5_ncps <- sample(
+  x = ex5_filtered_ncps,
+  size = n_5,
+  replace = TRUE
+)
+
+ex5_rerandom_tstats <- Vectorize(FUN = rt, vectorize.args = c("ncp"))(
+  n = 1, 
+  df = degrees_of_freedom,
+  ncp = ex5_ncps
+  )
+
+ex5_rerandom_is_significant <- (ex5_rerandom_tstats >= t_crit)
+print(paste("Significant statistics: ", sum(ex5_rerandom_is_significant)))
+ex5_rerandom_t_stats_significant <- ex5_rerandom_tstats[ex5_rerandom_is_significant]
+print(sprintf("Empirical mean of all t-stats: %.6f", mean(ex5_rerandom_tstats)))
+print(sprintf(
+  "Empirical mean of significant t-stats: %.6f", 
+  mean(ex5_rerandom_t_stats_significant)
+  ))
+
+ex5_rerandom_expected_biases <- Vectorize(FUN = get_expected_bias, vectorize.args = c("t_obs"))(
+    t_obs = ex5_rerandom_t_stats_significant,
+    t_crit = t_crit,
+    df = degrees_of_freedom
+    )
+
+print(sprintf(
+  "Empirical mean of significant t-stats: %.6f", 
+  mean(ex5_rerandom_t_stats_significant - ex5_rerandom_expected_biases)
+  ))
+
+ex5_results <- ex5_results %>%
+  add_row(
+    v = NaN, 
+    w = NaN, 
+    mu = NaN, 
+    sigma = NaN, 
+    mean = mean(ex5_rerandom_tstats),
+    estimate_naive = mean(ex5_rerandom_t_stats_significant),
+    estimate_debiased = mean(ex5_rerandom_t_stats_significant - ex5_rerandom_expected_biases),
+  )
+
+# save MSE scores to .csv
+write.table(ex5_results , file = "mse_scores/experiment_5_results_seeded.csv", sep=",", row.names=FALSE)
+```
+
+## Plot experiment 5 results
+
+```{r experiment_5_plot}
+ex5_results <- ex5_results %>%
+  mutate(
+    expected_bias = estimate_naive - estimate_debiased,
+    residual_naive = estimate_naive - mean,
+    residual_debiased = estimate_debiased - mean,
+    relative_reduction = (abs(residual_naive) - abs(residual_debiased))/residual_naive
+    )
+
+# prevent outliers from distoritng the scale of the plot
+
+outliers <- ex5_results[["relative_reduction"]] <= 0
+plot_size <- ex5_results[["relative_reduction"]]
+# replace size of outliers with mean of other points
+plot_size[outliers] <- mean(plot_size[!outliers])
+# annotate outliers with red text
+text_color <- rep("white", length(ex5_results[["estimate_naive"]]))
+text_color[outliers] <- "red"
+
+ex5_results <- ex5_results %>% mutate(plot_size = plot_size)
+
+
+# plot for F = N(mu, sigma^2)
+ex5_plt_1 <- ggplot(
+  data = ex5_results[14:49, ], 
+  aes(
+    x = factor(mu), 
+    y = factor(sigma), 
+    size = plot_size, 
+    color = residual_naive, 
+    label = scales::percent(relative_reduction, accuracy = 0.1)
+    )
+  )  +
+  geom_point() +
+  geom_text(colour = text_color[14:49], size = 4) +
+  scale_size(
+    range = c(15, 30),
+    breaks = c(0.1, 0.2, 0.3),
+    labels = c("10%", "20%", "30%")
+  ) +
+  scale_color_viridis_c(limits = c(0, 10),) +
+  labs(
+    x = "mean",
+    y = "standard deviation"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "top",
+    legend.title.align = 0.5,
+  ) +
+  guides(
+    size = guide_legend(
+      title = "relative reduction",
+      title.position="top", 
+      title.hjust = 0.5,
+      title.vjust = 0.5,
+      override.aes = list(size = c(3, 6, 9))
+    ),
+    color = guide_colorbar(
+      barwidth = 12,
+      title = "Abs. error naive",
+      title.position="top", 
+      title.hjust = 0.5,
+      title.vjust = 0.5
+    )
+  )
+
+print(ex5_plt_1)
+ggsave(
+  ex5_plt_1,
+  filename = paste("generated_plots/", "ex5_normals_plot",".pdf",sep =""),
+  device ="pdf",
+  dpi = "print",
+  width = 1440*2,
+  height = 1440*2,
+  units = "px",
+)
+
+
+# plot for F = U(v, w)
+ex5_plt_2 <- ggplot(data = ex5_results[1:13, c("v", "w", "mean", "estimate_naive", "estimate_debiased", "relative_reduction", "residual_naive")], aes(x = factor(v), y = factor(w), size = relative_reduction, color = residual_naive, label = scales::percent(relative_reduction, accuracy = 0.1)))  +
+  geom_point() +
+  geom_text(
+    colour = "white", 
+    size = 4
+  ) +
+  scale_size(
+    range = c(15, 35),
+    breaks = c(0.1, 0.2, 0.3),
+    labels = c("10%", "20%", "30%")
+  ) +
+  scale_color_viridis_c(limits = c(0, 8),) +
+  labs(
+    x = "v (min)",
+    y = "w (max)"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "top",
+    legend.title.align = 0.5,
+  ) +
+  guides(
+    size = guide_legend(
+      title = "relative reduction",
+      title.position="top", 
+      title.hjust = 0.5,
+      title.vjust = 0.5,
+      override.aes = list(size = c(3, 6, 9))
+    ),
+    color = guide_colorbar(
+      barwidth = 12,
+      title = "Abs. error naive",
+      title.position="top", 
+      title.hjust = 0.5,
+      title.vjust = 0.5
+    )
+  )
+
+print(ex5_plt_2)
+ggsave(
+  ex5_plt_2,
+  filename = paste("generated_plots/", "ex5_unif_plot",".pdf",sep =""),
+  device ="pdf",
+  dpi = "print",
+  width = 1440*2,
+  height = 1440*2,
+  units = "px",
+)
+```
+
+## Session Info
+
+```{r session_info}
+devtools::session_info()
+```
